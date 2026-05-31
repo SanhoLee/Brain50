@@ -1,0 +1,173 @@
+{
+  "name": "Brain Content Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 6 * * 1" }]
+        }
+      },
+      "id": "trigger-weekly",
+      "name": "⏰ 매주 월요일 오전 6시",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "notes": "매주 월요일 오전 6시에 전체 파이프라인 자동 시작"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stage 1: PubMed 논문 수집\nconst searchTerms = [\n  'sleep duration dementia risk longitudinal',\n  'glymphatic system sleep brain clearance',\n  'dementia prevention modifiable risk factors 2024',\n  'cognitive decline exercise BDNF elderly',\n  'mediterranean diet cognitive aging brain',\n];\n\nconst results = [];\n\nfor (const term of searchTerms) {\n  await new Promise(r => setTimeout(r, 400));\n  \n  const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(term)}&retmax=3&sort=relevance&retmode=json&datetype=pdat&reldate=730`;\n  \n  const searchRes = await fetch(searchUrl);\n  const searchData = await searchRes.json();\n  const pmids = searchData.esearchresult?.idlist || [];\n  \n  if (pmids.length === 0) continue;\n  \n  await new Promise(r => setTimeout(r, 400));\n  const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${pmids.join(',')}&retmode=xml&rettype=abstract`;\n  const fetchRes = await fetch(fetchUrl);\n  const xml = await fetchRes.text();\n  \n  // 간단 XML 파싱\n  const titles = xml.match(/<ArticleTitle>(.*?)<\\/ArticleTitle>/gs) || [];\n  const pmidMatches = xml.match(/<PMID[^>]*>(\\d+)<\\/PMID>/g) || [];\n  \n  for (let i = 0; i < Math.min(titles.length, pmidMatches.length); i++) {\n    const title = titles[i].replace(/<[^>]+>/g, '').trim();\n    const pmid = pmidMatches[i].replace(/<[^>]+>/g, '').trim();\n    results.push({ title, pmid, searchTerm: term, url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` });\n  }\n}\n\nreturn [{ json: { articles: results, fetchedAt: new Date().toISOString(), count: results.length } }];"
+      },
+      "id": "stage1-pubmed",
+      "name": "🔬 Stage 1: PubMed 논문 수집",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notes": "PubMed API에서 최신 논문 자동 수집 (무료, API 키 불필요)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $credentials.httpHeaderAuth.value }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 4000,\n  \"system\": \"당신은 Brain After 50 채널의 콘텐츠 작가입니다. 45~70세 대상 뇌 건강 채널. 핵심: 공포심 아닌 과학으로 실천 가능한 것을 알려줌. 3원칙: 1) 기승전결(기=5초훅, 승=데이터, 전=반전, 결=액션) 2) 자극요소(숫자충격/상식반전/개인화위협/희망반전/비밀공개 중 1개) 3) 신뢰데이터(논문인용 필수). JSON만 출력.\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"다음 논문들로 YouTube 숏폼 스크립트(50초, 130단어)를 작성하세요.\\n\\n논문 데이터:\\n{{ $json.articles.slice(0,3).map((a,i) => `[${i+1}] ${a.title} PMID:${a.pmid}`).join('\\\\n') }}\\n\\nJSON 형식으로만 출력:\\n{\\\"type\\\":\\\"shortform\\\",\\\"title\\\":\\\"YouTube제목\\\",\\\"hook\\\":\\\"첫5초훅\\\",\\\"script\\\":{\\\"gi\\\":\\\"기\\\",\\\"seung\\\":\\\"승\\\",\\\"jeon\\\":\\\"전\\\",\\\"gyeol\\\":\\\"결\\\"},\\\"fullScript\\\":\\\"전체스크립트\\\",\\\"citations\\\":[{\\\"claim\\\":\\\"주장\\\",\\\"source\\\":\\\"출처\\\",\\\"pubmedUrl\\\":\\\"url\\\"}],\\\"tags\\\":[],\\\"description\\\":\\\"설명란\\\"}\"\n  }]\n}"
+      },
+      "id": "stage2-claude",
+      "name": "✍️ Stage 2: Claude 스크립트 생성",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "credentials": {
+        "httpHeaderAuth": { "id": "anthropic-api-key", "name": "Anthropic API Key" }
+      },
+      "notes": "Claude API로 기승전결 스크립트 자동 생성"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Claude 응답 파싱 + 팩트체크 준비\nconst raw = $input.first().json.content[0].text;\nconst cleaned = raw.replace(/```json\\n?/g,'').replace(/```\\n?/g,'').trim();\n\nlet script;\ntry {\n  script = JSON.parse(cleaned);\n} catch(e) {\n  throw new Error('Claude 응답 JSON 파싱 실패: ' + e.message);\n}\n\n// 자동 위험 표현 스캔\nconst redFlagPatterns = [\n  { pattern: /반드시|절대|무조건|100%/, reason: '단정적 표현' },\n  { pattern: /기적|혁명적/, reason: '과장 표현' },\n  { pattern: /확실히 예방|완전 치료/, reason: '의학적 과장' },\n];\n\nconst redFlags = redFlagPatterns.filter(r => r.pattern.test(JSON.stringify(script)));\n\nreturn [{ json: { \n  script, \n  redFlags, \n  hasRedFlags: redFlags.length > 0,\n  generatedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "parse-script",
+      "name": "🔍 스크립트 파싱 + 위험표현 스캔",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.hasRedFlags }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notEquals" }
+            }
+          ]
+        }
+      },
+      "id": "check-redflags",
+      "name": "✅ 위험표현 없는가?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "notes": "위험 표현 있으면 Slack 알림 후 중단"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.elevenlabs.io/v1/text-to-speech/YOUR_VOICE_ID",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "xi-api-key", "value": "={{ $credentials.httpHeaderAuth.value }}" },
+            { "name": "Accept", "value": "audio/mpeg" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"text\": \"{{ $json.script.fullScript }}\",\n  \"model_id\": \"eleven_multilingual_v2\",\n  \"voice_settings\": {\n    \"stability\": 0.75,\n    \"similarity_boost\": 0.85,\n    \"style\": 0.2,\n    \"use_speaker_boost\": true\n  }\n}",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "id": "stage4-elevenlabs",
+      "name": "🎙️ Stage 4: ElevenLabs 음성 생성",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 220],
+      "credentials": {
+        "httpHeaderAuth": { "id": "elevenlabs-api-key", "name": "ElevenLabs API Key" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"text\": \"⚠️ *Brain Pipeline 경고*\\n위험 표현 발견: {{ $json.redFlags.map(r=>r.reason).join(', ') }}\\n스크립트 제목: {{ $json.script.title }}\\n\\n👤 수동 검토 후 파이프라인을 재실행하세요.\"\n}"
+      },
+      "id": "slack-alert-redflag",
+      "name": "🚨 Slack 경고 (위험표현)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 420],
+      "notes": "위험 표현 감지 시 Slack으로 즉시 알림"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"text\": \"✅ *Brain Pipeline 완료*\\n📝 제목: {{ $json.script.title }}\\n🎙️ 음성 생성 완료\\n\\n*다음 할 일:*\\n1. 스크립트 검토 (15~20분)\\n2. Pictory에서 영상 합성\\n3. YouTube 예약 업로드\\n\\n*인용 출처:*\\n{{ $json.script.citations?.slice(0,3).map(c=>`• ${c.source}`).join('\\\\n') }}\"\n}"
+      },
+      "id": "slack-complete",
+      "name": "✅ Slack 완료 알림",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 220],
+      "notes": "파이프라인 완료 시 Slack으로 리뷰 요청 알림"
+    }
+  ],
+  "connections": {
+    "⏰ 매주 월요일 오전 6시": {
+      "main": [[{ "node": "🔬 Stage 1: PubMed 논문 수집", "type": "main", "index": 0 }]]
+    },
+    "🔬 Stage 1: PubMed 논문 수집": {
+      "main": [[{ "node": "✍️ Stage 2: Claude 스크립트 생성", "type": "main", "index": 0 }]]
+    },
+    "✍️ Stage 2: Claude 스크립트 생성": {
+      "main": [[{ "node": "🔍 스크립트 파싱 + 위험표현 스캔", "type": "main", "index": 0 }]]
+    },
+    "🔍 스크립트 파싱 + 위험표현 스캔": {
+      "main": [[{ "node": "✅ 위험표현 없는가?", "type": "main", "index": 0 }]]
+    },
+    "✅ 위험표현 없는가?": {
+      "main": [
+        [{ "node": "🎙️ Stage 4: ElevenLabs 음성 생성", "type": "main", "index": 0 }],
+        [{ "node": "🚨 Slack 경고 (위험표현)", "type": "main", "index": 0 }]
+      ]
+    },
+    "🎙️ Stage 4: ElevenLabs 음성 생성": {
+      "main": [[{ "node": "✅ Slack 완료 알림", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  }
+}
