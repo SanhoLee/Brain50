@@ -1,0 +1,4 @@
+# .env files
+.env
+*.env
+!.env.example     # .env.example 파일은 공개하고 싶을 때 (템플릿용)

@@ -1,147 +1,153 @@
 // ============================================================
-//  MASTER RUNNER — 전체 파이프라인 순서 실행
+//  MASTER RUNNER — 클라우드 서버 운영 버전
 //  실행: node run-pipeline.js
-//  옵션: node run-pipeline.js --stage=1,2  (특정 스테이지만)
+//  특정 스테이지: node run-pipeline.js --stage=1,2
 // ============================================================
 
-const { runResearchFetch } = require('./stage1-research/pubmed-fetcher');
-const { runScriptGeneration } = require('./stage2-script/claude-script-generator');
-const { runFactCheck } = require('./stage3-factcheck/fact-checker');
-const { runVoiceGeneration } = require('./stage4-voice/voice-generator');
-const fs = require('fs');
+require('dotenv').config();
+
+const { runResearchFetch }    = require('./stage1-research/pubmed-fetcher');
+const { runScriptGeneration } = require('./stage2-script/script-generator');
+const { runFactCheck }        = require('./stage3-factcheck/fact-checker');
+const { runTTSGeneration }    = require('./stage4-tts/tts-generator');
+const { runVideoGeneration }  = require('./stage5-video/video-generator');
+const { sendMessage }         = require('./telegram-bot');
+const fs   = require('fs');
 const path = require('path');
 
-// 실행할 스테이지 파싱 (--stage=1,2,3 형식)
 const stageArg = process.argv.find(a => a.startsWith('--stage='));
 const targetStages = stageArg
   ? stageArg.replace('--stage=', '').split(',').map(Number)
-  : [1, 2, 3, 4]; // 기본: Stage 1~4 (5는 영상 합성 후 수동)
+  : [1, 2, 3, 4, 5];
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
 async function runPipeline() {
+  const startTime = new Date();
   console.log('🚀 Brain Content Pipeline 시작\n');
-  console.log(`   실행 스테이지: ${targetStages.join(', ')}`);
-  console.log(`   시작 시간: ${new Date().toLocaleString('ko-KR')}`);
-  console.log('═'.repeat(55) + '\n');
+  console.log(`   LLM: ${process.env.DEFAULT_LLM || 'anthropic'} | TTS: ${process.env.TTS_ENGINE || 'openai'}`);
+  console.log(`   스테이지: ${targetStages.join(', ')}`);
+  console.log(`   시작: ${startTime.toLocaleString('ko-KR')}`);
+  console.log('═'.repeat(50) + '\n');
 
-  // 출력 디렉토리 초기화
-  ['output/research', 'output/scripts', 'output/audio',
-   'output/factcheck', 'output/video', 'output/logs'].forEach(dir => {
-    fs.mkdirSync(path.join(__dirname, dir), { recursive: true });
+  ['output/research','output/scripts','output/audio',
+   'output/video','output/factcheck','output/logs'].forEach(d => {
+    fs.mkdirSync(path.join(__dirname, d), { recursive: true });
   });
 
-  const pipelineLog = {
-    startedAt: new Date().toISOString(),
-    stages: {},
-  };
+  const log = { startedAt: startTime.toISOString(), stages: {} };
 
-  // ── Stage 1: Research Fetch ───────────────────────────
+  // Stage 1
   let researchData = null;
   if (targetStages.includes(1)) {
-    console.log('━'.repeat(55));
+    console.log('━'.repeat(50));
     console.log('STAGE 1: PubMed 논문 수집');
-    console.log('━'.repeat(55));
+    console.log('━'.repeat(50));
     try {
       researchData = await runResearchFetch();
-      pipelineLog.stages.stage1 = { status: 'success', articles: researchData.totalArticles };
-      console.log('\n⏸  3초 대기...\n');
-      await delay(3000);
-    } catch (err) {
-      pipelineLog.stages.stage1 = { status: 'error', error: err.message };
-      console.error(`\n❌ Stage 1 실패: ${err.message}`);
-      process.exit(1);
+      log.stages.stage1 = { status: 'success', articles: researchData.totalArticles };
+      await delay(2000);
+    } catch (e) {
+      log.stages.stage1 = { status: 'error', error: e.message };
+      await sendMessage(`❌ *Stage 1 실패*\n\`${e.message}\`\n\n서버 SSH 접속 후 확인 필요`);
+      saveLog(log); process.exit(1);
     }
   }
 
-  // ── Stage 2: Script Generation ────────────────────────
-  let scripts = null;
+  // Stage 2
   if (targetStages.includes(2)) {
-    console.log('━'.repeat(55));
-    console.log('STAGE 2: 스크립트 생성 (Claude API)');
-    console.log('━'.repeat(55));
+    console.log('\n' + '━'.repeat(50));
+    console.log('STAGE 2: 스크립트 생성');
+    console.log('━'.repeat(50));
     try {
-      scripts = await runScriptGeneration(researchData);
-      pipelineLog.stages.stage2 = { status: 'success', scriptsGenerated: scripts.length };
-      console.log('\n⏸  3초 대기...\n');
-      await delay(3000);
-    } catch (err) {
-      pipelineLog.stages.stage2 = { status: 'error', error: err.message };
-      console.error(`\n❌ Stage 2 실패: ${err.message}`);
-      process.exit(1);
+      await runScriptGeneration(researchData);
+      log.stages.stage2 = { status: 'success' };
+      await delay(2000);
+    } catch (e) {
+      log.stages.stage2 = { status: 'error', error: e.message };
+      await sendMessage(`❌ *Stage 2 실패*\n\`${e.message}\``);
+      saveLog(log); process.exit(1);
     }
   }
 
-  // ── Stage 3: Fact Check ───────────────────────────────
+  // Stage 3
   if (targetStages.includes(3)) {
-    console.log('━'.repeat(55));
-    console.log('STAGE 3: 팩트체크 & 출처 검증');
-    console.log('━'.repeat(55));
+    console.log('\n' + '━'.repeat(50));
+    console.log('STAGE 3: 팩트체크');
+    console.log('━'.repeat(50));
     try {
       const report = await runFactCheck();
-      pipelineLog.stages.stage3 = { status: 'success', overallStatus: report.overallStatus };
+      log.stages.stage3 = { status: 'success', overall: report.overallStatus };
 
-      // 미검증 주장이 있으면 파이프라인 중단 (안전 장치)
       if (report.summary.unverified > 0 || report.redFlags.length > 0) {
-        console.log('\n🛑 팩트체크 실패 — 파이프라인 중단');
-        console.log('   미검증 주장 또는 위험 표현 발견. 스크립트를 수정 후 재실행하세요.');
-        console.log(`   팩트체크 리포트: output/factcheck/`);
-        savePipelineLog(pipelineLog);
-        process.exit(0);
+        await sendMessage(
+          `⚠️ *팩트체크 경고 — 검토 필요*\n\n` +
+          `미검증 주장: ${report.summary.unverified}개\n` +
+          `위험 표현: ${report.redFlags.length}개\n\n` +
+          `👉 스크립트 수정 후 다시 실행:\n` +
+          `/run 으로 재실행 가능`
+        );
+        saveLog(log); process.exit(0);
       }
-
-      console.log('\n⏸  2초 대기...\n');
-      await delay(2000);
-    } catch (err) {
-      pipelineLog.stages.stage3 = { status: 'error', error: err.message };
-      console.error(`\n❌ Stage 3 실패: ${err.message}`);
-      process.exit(1);
+      await delay(1500);
+    } catch (e) {
+      log.stages.stage3 = { status: 'error', error: e.message };
     }
   }
 
-  // ── Stage 4: Voice Generation ─────────────────────────
+  // Stage 4
   if (targetStages.includes(4)) {
-    console.log('━'.repeat(55));
-    console.log('STAGE 4: 음성 생성 (ElevenLabs)');
-    console.log('━'.repeat(55));
+    console.log('\n' + '━'.repeat(50));
+    console.log(`STAGE 4: TTS 음성 생성`);
+    console.log('━'.repeat(50));
     try {
-      const audioMeta = await runVoiceGeneration();
-      pipelineLog.stages.stage4 = { status: 'success', audioFile: audioMeta.audioInfo?.outputPath };
-    } catch (err) {
-      pipelineLog.stages.stage4 = { status: 'error', error: err.message };
-      console.error(`\n❌ Stage 4 실패: ${err.message}`);
+      await runTTSGeneration();
+      log.stages.stage4 = { status: 'success' };
+    } catch (e) {
+      log.stages.stage4 = { status: 'error', error: e.message };
+      console.error(`Stage 4 실패: ${e.message}`);
     }
   }
 
-  // ── 완료 요약 ────────────────────────────────────────
-  pipelineLog.completedAt = new Date().toISOString();
-  savePipelineLog(pipelineLog);
-
-  console.log('\n' + '═'.repeat(55));
-  console.log('✅ 파이프라인 완료!');
-  console.log('═'.repeat(55));
-  console.log('\n📋 스테이지별 결과:');
-  for (const [stage, result] of Object.entries(pipelineLog.stages)) {
-    const icon = result.status === 'success' ? '✅' : '❌';
-    console.log(`  ${icon} ${stage}: ${result.status}`);
+  // Stage 5
+  if (targetStages.includes(5)) {
+    console.log('\n' + '━'.repeat(50));
+    console.log('STAGE 5: Remotion 영상 합성');
+    console.log('━'.repeat(50));
+    try {
+      await runVideoGeneration();
+      log.stages.stage5 = { status: 'success' };
+    } catch (e) {
+      log.stages.stage5 = { status: 'error', error: e.message };
+      console.error(`Stage 5 실패: ${e.message}`);
+    }
   }
 
-  console.log('\n━'.repeat(55));
-  console.log('👤 【지금부터 당신이 해야 할 것】');
-  console.log('━'.repeat(55));
-  console.log('1. output/factcheck/ 에서 검증 리포트 확인');
-  console.log('2. output/scripts/ 에서 스크립트 내용 검토 (15~20분)');
-  console.log('3. output/audio/ 에서 음성 파일 청취 확인');
-  console.log('4. Pictory/Invideo에 오디오 업로드 → 영상 합성');
-  console.log('5. 완성 영상을 output/video/에 저장 후:');
-  console.log('   node stage5-youtube/youtube-uploader.js 실행');
-  console.log('━'.repeat(55));
+  // 완료 Telegram 알림
+  const successCount = Object.values(log.stages).filter(s => s.status === 'success').length;
+  const elapsed = Math.round((Date.now() - startTime.getTime()) / 60000);
+
+  await sendMessage(
+    `✅ *파이프라인 완료!* (${successCount}/${targetStages.length} 성공, ${elapsed}분 소요)\n\n` +
+    `📋 *지금 해야 할 것:*\n` +
+    `1. 스크립트 검토 — SSH 접속 후:\n` +
+    `\`cat ~/brain-pipeline/output/scripts/최신파일.json\`\n\n` +
+    `2. 음성 파일 확인 후 영상 합성\n\n` +
+    `3. YouTube 업로드 준비 완료 후:\n` +
+    `/run_upload 로 업로드 실행`
+  );
+
+  saveLog(log);
+  console.log('\n✅ 완료! Telegram으로 알림 발송됨');
 }
 
-function savePipelineLog(log) {
-  const logPath = path.join(__dirname, `output/logs/pipeline-${Date.now()}.json`);
-  fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
-  console.log(`\n📁 파이프라인 로그: ${logPath}`);
+function saveLog(log) {
+  log.completedAt = new Date().toISOString();
+  const p = path.join(__dirname, `output/logs/pipeline-${Date.now()}.json`);
+  fs.writeFileSync(p, JSON.stringify(log, null, 2));
 }
 
-runPipeline().catch(console.error);
+runPipeline().catch(async (e) => {
+  console.error('파이프라인 오류:', e);
+  await sendMessage(`💥 *파이프라인 예상치 못한 오류*\n\`${e.message}\``);
+});
