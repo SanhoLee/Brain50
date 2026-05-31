@@ -1,259 +1,417 @@
-# Brain Content Pipeline — 설정 가이드
+# Brain Content Pipeline — 클라우드 서버 운영 가이드
+## 스택: AWS Lightsail(서버) + n8n(자동화) + Claude/GPT(스크립트) + OpenAI TTS + Remotion(영상)
 
-## 전체 구조
+---
+
+## 전체 구조 이해 (가장 먼저 읽을 것)
 
 ```
-파이프라인 자동 실행 흐름
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[매주 월요일 오전 6시 자동 시작]
-        ↓
-Stage 1: PubMed 논문 수집         ← 자동 (당신 개입 없음)
-        ↓
-Stage 2: Claude 스크립트 생성      ← 자동
-        ↓
-Stage 3: 위험표현 스캔             ← 자동
-        ↓
-   [위험표현 발견?]
-   YES → Slack 경고 → 당신이 수정
-   NO  ↓
-Stage 4: ElevenLabs 음성 생성     ← 자동
-        ↓
-Slack 알림 → 당신에게 검토 요청   ← 👤 당신 개입 (15~20분)
-        ↓
-[Pictory/Invideo 영상 합성]        ← 당신이 클릭 몇 번
-        ↓
-Stage 5: YouTube 예약 업로드       ← 자동
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌─────────────────────────────────────────────────────────┐
+│  내 Windows PC (설정할 때만 사용, 평소엔 꺼도 됨)         │
+│  - SSH로 서버 접속                                        │
+│  - 파일 업로드 (최초 1회)                                 │
+│  - Telegram으로 파이프라인 상태 확인 및 명령              │
+└───────────────┬─────────────────────────────────────────┘
+                │ SSH 접속 (설정시만)
+                ▼
+┌─────────────────────────────────────────────────────────┐
+│  AWS Lightsail 서버 $5/월 (24시간 365일 실행)             │
+│                                                          │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  n8n (자동화 엔진) — 매주 월요일 06:00 자동 실행  │    │
+│  └────────────────────┬────────────────────────────┘    │
+│                        │                                 │
+│  Stage 1: PubMed 논문 수집 (자동)                        │
+│  Stage 2: Claude/GPT 스크립트 생성 (자동)                │
+│  Stage 3: 팩트체크 + 위험표현 스캔 (자동)                │
+│  Stage 4: OpenAI TTS 음성 생성 (자동)                    │
+│  Stage 5: Remotion 영상 합성 (자동)                      │
+│  Stage 6: YouTube 예약 업로드 (자동)                     │
+└─────────────────────────────────────────────────────────┘
+                        │ Telegram 알림
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  내 스마트폰 Telegram                                     │
+│  - 파이프라인 완료 알림 수신                              │
+│  - /run /status /logs 명령어로 원격 제어                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+**핵심 원칙:** 모든 코드와 설정은 서버에 있습니다. 내 PC는 최초 설정할 때만 씁니다.
+
+---
+
+## 월 예상 비용
+
+| 항목 | 비용 | 비고 |
+|---|---|---|
+| AWS Lightsail 서버 | $5/월 | n8n + 파이프라인 실행 |
+| Anthropic API | ~$3/월 | 롱폼 스크립트 |
+| OpenAI API (GPT + TTS) | ~$5/월 | 숏폼 + 음성 |
+| Remotion | 무료 | 개발자 라이선스 |
+| YouTube / PubMed API | 무료 | |
+| Telegram Bot | 무료 | |
+| **합계** | **~$13/월** | |
+
+---
+
+## 설정 순서 (이 순서대로 진행할 것)
+
+```
+PHASE 1: 클라우드 서버 만들기       ← AWS에서 서버 생성
+PHASE 2: 서버 접속하기              ← 내 PC에서 SSH
+PHASE 3: 서버에 프로그램 설치       ← 서버에서 명령어 실행
+PHASE 4: API 키 서버에 설정         ← 서버 .env 파일 작성
+PHASE 5: Telegram 봇 설정           ← 알림 + 명령 수신
+PHASE 6: n8n 자동화 설정            ← 브라우저에서 워크플로우 임포트
+PHASE 7: 첫 번째 테스트             ← 서버에서 파이프라인 실행
 ```
 
 ---
 
-## 셋업 작업 목록
+## PHASE 1: 클라우드 서버 만들기
 
-### ✅ 내가 이미 만들어 놓은 것
-- `config.js` — 전체 설정 파일
-- `stage1-research/pubmed-fetcher.js` — PubMed 자동 수집
-- `stage2-script/claude-script-generator.js` — Claude 스크립트 생성
-- `stage3-factcheck/fact-checker.js` — 팩트체크 자동화
-- `stage4-voice/voice-generator.js` — ElevenLabs 음성 생성
-- `stage5-youtube/youtube-uploader.js` — YouTube 업로드
-- `run-pipeline.js` — 전체 파이프라인 실행기
-- `n8n/workflow.json` — n8n 비주얼 워크플로우 (임포트용)
+### 1-1. AWS 계정 만들기 (최초 1회, 약 5분)
+
+1. https://aws.amazon.com 접속 → "AWS 계정 생성" 클릭
+2. 이메일 / 비밀번호 / 계정 이름 입력
+3. 신용카드 입력 (즉시 청구 안 됨, $5 이상 나오지 않음)
+4. 휴대폰 문자 인증 → 지원 플랜: **기본 무료** 선택
+5. 가입 완료 → AWS Management Console 로그인
+
+### 1-2. Lightsail 서버 생성 (약 5분)
+
+1. AWS Console 상단 검색창 → `Lightsail` 입력 → 클릭
+2. "인스턴스 생성" 클릭
+3. 설정:
+   - 인스턴스 위치: **도쿄 (ap-northeast-1)** (한국에서 가장 빠름)
+   - 플랫폼: **Linux/Unix**
+   - 블루프린트: **OS만 (OS Only)** → **Ubuntu 22.04 LTS**
+   - 플랜: **$5/월 (1GB RAM, 40GB SSD)**
+   - 인스턴스 이름: `brain-pipeline`
+4. "인스턴스 생성" 클릭 → 약 1~2분 후 "실행 중" 확인
+5. **IP 주소 메모** (예: 12.34.56.78) — 이후 계속 사용
+
+### 1-3. 방화벽 포트 열기 (약 2분)
+
+1. brain-pipeline 인스턴스 클릭 → **"네트워킹"** 탭
+2. IPv4 방화벽 → "규칙 추가"
+3. 설정: 애플리케이션=사용자 지정 / 프로토콜=TCP / 포트=`5678`
+4. "저장"
 
 ---
 
-## 👤 당신이 설정해야 할 것 (단계별)
+## PHASE 2: 서버 접속하기 (내 Windows PC에서)
+
+### 2-1. SSH 키 다운로드
+
+1. Lightsail 홈 → 우측 상단 계정 아이콘 → **"SSH 키"**
+2. 기본 키 옆 **"다운로드"** → `.pem` 파일 저장
+3. 파일을 `C:\Users\[내이름]\.ssh\` 폴더로 이동
+
+> ⚠️ .pem 파일은 절대 외부 공유 금지
+
+### 2-2. PowerShell로 서버 접속
+
+**시작 메뉴 → PowerShell → 관리자 권한으로 실행**
+
+```powershell
+# 키 파일 권한 설정 (최초 1회)
+icacls "$env:USERPROFILE\.ssh\LightsailDefaultKey-ap-northeast-1.pem" /inheritance:r /grant:r "$env:USERNAME:R"
+
+# 서버 접속 (IP는 본인 것으로 교체)
+ssh -i "$env:USERPROFILE\.ssh\LightsailDefaultKey-ap-northeast-1.pem" ubuntu@12.34.56.78
+```
+
+"Are you sure...?" → `yes` 입력
+
+`ubuntu@ip-xxx:~$` 가 나오면 **서버 접속 성공!**
+
+> 이후 모든 명령어는 이 SSH 창에서 실행합니다 (서버에서 실행)
 
 ---
 
-### STEP 1: 기본 환경 설치 (30분)
+## PHASE 3: 서버에 프로그램 설치 (SSH 접속 상태에서)
+
+### 3-1. 기본 패키지 업데이트
 
 ```bash
-# Node.js 설치 (https://nodejs.org — LTS 버전)
-node --version  # v18 이상 확인
-
-# 프로젝트 디렉토리에서 실행
-cd brain-content-pipeline
-npm init -y
+sudo apt-get update && sudo apt-get upgrade -y
 ```
 
----
-
-### STEP 2: Anthropic API 키 발급 (10분)
-
-1. https://console.anthropic.com 접속
-2. API Keys → Create Key
-3. 키 복사 후 환경변수 설정:
+### 3-2. Node.js 설치
 
 ```bash
-# Mac/Linux
-export ANTHROPIC_API_KEY="sk-ant-xxxxxxxx"
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
-# Windows PowerShell
-$env:ANTHROPIC_API_KEY="sk-ant-xxxxxxxx"
+# 확인 (v20.x 이상 나오면 성공)
+node --version
+npm --version
 ```
 
-**예상 비용:** 스크립트 1개당 약 $0.01~0.03 (월 $2~5 수준)
-
----
-
-### STEP 3: ElevenLabs 계정 & 목소리 설정 (20분)
-
-1. https://elevenlabs.io 가입 (무료 플랜 시작 가능)
-2. API Keys에서 키 복사
-3. Voice Library에서 목소리 선택:
-   - 추천: "한국어 지원 남성 목소리" 검색
-   - 또는 Voice Cloning으로 자신의 목소리 복제
-4. 선택한 목소리의 Voice ID 복사 (URL에서 확인)
+### 3-3. Docker 설치
 
 ```bash
-export ELEVENLABS_API_KEY="your_key"
-export ELEVENLABS_VOICE_ID="your_voice_id"
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker ubuntu
+newgrp docker
+
+# 확인
+docker --version
 ```
 
-**config.js에서 voiceId 수정:**
-```javascript
-voiceId: 'YOUR_VOICE_ID_HERE',
-```
-
-**예상 비용:** Starter 플랜 $5/월 (월 30,000자 포함, 숏폼 약 30개)
-
----
-
-### STEP 4: YouTube Data API 설정 (40분 — 가장 복잡)
-
-#### 4-1. Google Cloud Console 설정
-1. https://console.cloud.google.com 접속
-2. 새 프로젝트 생성 ("brain-content-pipeline")
-3. API 및 서비스 → 라이브러리 → "YouTube Data API v3" 검색 → 사용 설정
-4. 사용자 인증 정보 → OAuth 2.0 클라이언트 ID 만들기
-   - 애플리케이션 유형: 데스크톱 앱
-   - 클라이언트 ID, 클라이언트 보안 비밀 복사
-
-#### 4-2. Refresh Token 발급
-```bash
-# 브라우저에서 아래 URL 접속 (client_id 교체)
-https://accounts.google.com/o/oauth2/auth?client_id=YOUR_CLIENT_ID&redirect_uri=urn:ietf:wg:oauth:2.0:oob&scope=https://www.googleapis.com/auth/youtube.upload&response_type=code
-
-# 표시된 코드로 토큰 교환
-curl -X POST https://oauth2.googleapis.com/token \
-  -d "client_id=YOUR_CLIENT_ID" \
-  -d "client_secret=YOUR_CLIENT_SECRET" \
-  -d "code=YOUR_AUTH_CODE" \
-  -d "grant_type=authorization_code" \
-  -d "redirect_uri=urn:ietf:wg:oauth:2.0:oob"
-
-# 응답에서 refresh_token 복사
-```
+### 3-4. n8n 실행
 
 ```bash
-export YOUTUBE_CLIENT_ID="your_client_id"
-export YOUTUBE_CLIENT_SECRET="your_client_secret"
-export YOUTUBE_REFRESH_TOKEN="your_refresh_token"
-```
-
----
-
-### STEP 5: PubMed API 키 발급 (선택사항, 10분)
-
-- 없어도 동작하지만 속도 제한이 있음 (3req/sec → 10req/sec)
-- https://www.ncbi.nlm.nih.gov/account/ 가입 → API Key 발급
-
-```bash
-export PUBMED_API_KEY="your_pubmed_key"
-```
-
----
-
-### STEP 6: Slack 알림 설정 (10분)
-
-1. https://api.slack.com/apps → 새 앱 만들기
-2. Incoming Webhooks 활성화
-3. 채널 선택 후 Webhook URL 복사
-4. `n8n/workflow.json`에서 `YOUR_SLACK_WEBHOOK_URL` 교체
-
----
-
-### STEP 7: n8n 설치 & 워크플로우 임포트 (30분)
-
-#### 옵션 A: n8n Cloud (가장 쉬움, $20/월)
-1. https://n8n.io 가입
-2. 새 워크플로우 → Import → `n8n/workflow.json` 업로드
-
-#### 옵션 B: 자체 서버 (무료)
-```bash
-# Docker로 실행
-docker run -it --rm \
+# 비밀번호는 본인이 원하는 것으로 교체
+docker run -d \
   --name n8n \
+  --restart always \
   -p 5678:5678 \
   -v ~/.n8n:/home/node/.n8n \
+  -e N8N_BASIC_AUTH_ACTIVE=true \
+  -e N8N_BASIC_AUTH_USER=admin \
+  -e N8N_BASIC_AUTH_PASSWORD=내비밀번호 \
+  -e GENERIC_TIMEZONE=Asia/Seoul \
   n8nio/n8n
 
-# 접속: http://localhost:5678
+# 실행 확인
+docker ps
 ```
 
-#### n8n에서 Credentials 설정
-1. Settings → Credentials → Add
-2. "HTTP Header Auth" 타입으로 각각 추가:
-   - `Anthropic API Key`: Header = `x-api-key`, Value = 키 값
-   - `ElevenLabs API Key`: Header = `xi-api-key`, Value = 키 값
-3. `workflow.json`의 `YOUR_VOICE_ID` → 실제 Voice ID로 교체
+브라우저에서 `http://서버IP:5678` 접속 → n8n 로그인 화면 나오면 성공!
 
----
+### 3-5. 파이프라인 코드 서버에 업로드
 
-### STEP 8: 영상 합성 도구 설정 (Pictory 추천)
+**새 PowerShell 창에서** (기존 SSH 창은 그대로 유지):
 
-**Pictory (추천, $19/월)**
-1. https://pictory.ai 가입
-2. Script to Video 기능 사용
-3. output/audio/의 MP3 + 스크립트 텍스트 입력
-4. 자동 스톡 영상 매칭 → 완성 영상 다운로드
-5. output/video/에 저장
+```powershell
+# 내 PC → 서버로 파일 업로드 (경로와 IP는 본인 것으로 교체)
+scp -i "$env:USERPROFILE\.ssh\LightsailDefaultKey-ap-northeast-1.pem" -r `
+  "C:\Users\내이름\brain-pipeline-v2\*" `
+  ubuntu@12.34.56.78:~/brain-pipeline/
+```
 
-**대안: Invideo AI ($20/월)**
-- 비슷한 방식, UI가 더 직관적
-
----
-
-### STEP 9: 첫 번째 테스트 실행
+**서버 SSH 창으로 돌아와서:**
 
 ```bash
-# Stage 1만 테스트 (API 키 없이 가능)
+cd ~/brain-pipeline
+npm install dotenv
+ls   # 파일들이 업로드됐는지 확인
+```
+
+---
+
+## PHASE 4: API 키 서버에 설정
+
+> 모든 API 키는 서버의 `.env` 파일에 저장합니다 (내 PC가 아닙니다!)
+
+```bash
+# 서버에서 실행
+cd ~/brain-pipeline
+nano .env
+```
+
+아래 내용을 입력 후 `Ctrl+O` → Enter → `Ctrl+X` 로 저장:
+
+```
+ANTHROPIC_API_KEY=sk-ant-여기에입력
+OPENAI_API_KEY=sk-여기에입력
+YOUTUBE_CLIENT_ID=여기에입력.apps.googleusercontent.com
+YOUTUBE_CLIENT_SECRET=여기에입력
+YOUTUBE_REFRESH_TOKEN=여기에입력
+PUBMED_API_KEY=여기에입력
+TELEGRAM_BOT_TOKEN=여기에입력
+TELEGRAM_CHAT_ID=여기에입력
+DEFAULT_LLM=anthropic
+TTS_ENGINE=openai
+VIDEO_ENGINE=remotion
+CHANNEL_LANGUAGE=ko
+```
+
+### 4-1. Anthropic API 키 발급
+
+1. https://console.anthropic.com 로그인
+2. API Keys → Create Key → 복사
+3. Settings → Billing → $10~20 충전
+
+### 4-2. OpenAI API 키 발급
+
+1. https://platform.openai.com 로그인
+2. 우측 상단 프로필 → API keys → Create new secret key → 복사
+3. Settings → Billing → $10 충전
+
+### 4-3. PubMed API 키 발급 (선택사항 — 없으면 속도 느림)
+
+- 없어도 동작하지만 논문 수집 속도가 3배 느려집니다 (3→10 req/sec)
+1. https://www.ncbi.nlm.nih.gov/account/ 회원가입
+2. Settings → API Key Management → Create API Key → 복사
+
+### 4-4. YouTube API 설정 (가장 복잡, 약 40분)
+
+**4-4-1. Google Cloud 설정:**
+1. https://console.cloud.google.com 접속
+2. 새 프로젝트 생성 → 이름: `brain-pipeline`
+3. API 및 서비스 → 라이브러리 → "YouTube Data API v3" → 사용 설정
+4. 사용자 인증 정보 → OAuth 2.0 클라이언트 ID 만들기
+   - 유형: **데스크톱 앱**
+   - 클라이언트 ID, 보안 비밀 복사
+
+**4-4-2. OAuth 동의 화면:**
+1. OAuth 동의 화면 → 외부 → 앱 만들기
+2. 앱 이름 입력 → 테스트 사용자에 본인 Gmail 추가
+
+**4-4-3. Refresh Token 발급 (내 PC PowerShell에서):**
+
+```powershell
+# Chrome에서 아래 URL 접속 (CLIENT_ID 교체)
+# https://accounts.google.com/o/oauth2/auth?client_id=CLIENT_ID입력&redirect_uri=urn:ietf:wg:oauth:2.0:oob&scope=https://www.googleapis.com/auth/youtube.upload&response_type=code
+
+# 허용 후 나온 코드로 토큰 교환
+$body = "client_id=CLIENT_ID&client_secret=CLIENT_SECRET&code=인증코드&grant_type=authorization_code&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+$r = Invoke-RestMethod -Uri "https://oauth2.googleapis.com/token" -Method POST -Body $body -ContentType "application/x-www-form-urlencoded"
+$r.refresh_token   # 이 값을 .env의 YOUTUBE_REFRESH_TOKEN에 입력
+```
+
+---
+
+## PHASE 5: Telegram 봇 설정 (약 10분)
+
+> Telegram은 Slack 대신 사용합니다. **완전 무료 + 양방향 명령 전달 가능**
+
+### 5-1. 봇 만들기
+
+1. Telegram 앱에서 **@BotFather** 검색 → 채팅
+2. `/newbot` 입력
+3. 봇 이름 입력 (예: `BrainPipelineBot`)
+4. 봇 사용자명 입력 (영어, _bot으로 끝나야 함, 예: `my_brain_pipeline_bot`)
+5. **Token 복사** → `.env`의 `TELEGRAM_BOT_TOKEN`에 입력
+
+### 5-2. 내 Chat ID 확인
+
+1. Telegram에서 **@userinfobot** 검색 → `/start` 입력
+2. 숫자로 된 **Id** 값 복사 → `.env`의 `TELEGRAM_CHAT_ID`에 입력
+
+### 5-3. 봇 서버에서 실행
+
+```bash
+# 서버 SSH에서 실행
+cd ~/brain-pipeline
+
+# 봇 백그라운드 실행
+nohup node telegram-bot.js > logs/telegram-bot.log 2>&1 &
+
+# 실행 확인
+ps aux | grep telegram
+```
+
+Telegram에서 본인 봇에 `/help` 입력 → 명령어 목록이 오면 성공!
+
+### 5-4. 서버 재시작 시 자동 실행 설정
+
+```bash
+# crontab 설정
+crontab -e
+
+# 아래 줄 추가 (파일 맨 아래에)
+@reboot cd ~/brain-pipeline && nohup node telegram-bot.js > logs/telegram-bot.log 2>&1 &
+@reboot cd ~/brain-pipeline && nohup node run-pipeline.js >> logs/cron.log 2>&1
+
+# 매주 월요일 오전 6시 파이프라인 자동 실행
+0 6 * * 1 cd ~/brain-pipeline && node run-pipeline.js >> logs/cron.log 2>&1
+```
+
+`Ctrl+O` → Enter → `Ctrl+X` 로 저장
+
+---
+
+## PHASE 6: n8n 워크플로우 설정 (약 15분)
+
+1. 브라우저에서 `http://서버IP:5678` → 로그인
+2. Workflows → "+ New Workflow"
+3. 우측 상단 "..." → "Import from File"
+4. 내 PC의 `brain-pipeline-v2\n8n\workflow.json` 업로드
+5. 각 노드 Credentials 설정:
+
+```
+Settings → Credentials → Add:
+
+1. Anthropic: HTTP Header Auth
+   Name: x-api-key / Value: sk-ant-xxxxx
+
+2. OpenAI: HTTP Header Auth
+   Name: Authorization / Value: Bearer sk-xxxxx
+```
+
+6. 워크플로우 우측 상단 토글 → **"Active"** 전환 → 저장
+
+---
+
+## PHASE 7: 첫 번째 테스트 (서버 SSH에서)
+
+```bash
+cd ~/brain-pipeline
+
+# Stage 1만 테스트 (API 키 불필요)
 node stage1-research/pubmed-fetcher.js
+ls output/research/   # JSON 파일 생성 확인
 
-# Stage 1~2 테스트
+# Stage 1~2 테스트 (Anthropic/OpenAI 키 필요)
 node run-pipeline.js --stage=1,2
+ls output/scripts/    # 스크립트 파일 생성 확인
 
-# 전체 실행
+# 전체 파이프라인 테스트
 node run-pipeline.js
 ```
 
+Telegram으로 알림이 오면 전체 설정 완료!
+
 ---
 
-## 비용 요약
+## 운영 중 자주 쓰는 명령어
 
-| 서비스 | 플랜 | 월 비용 |
+### 서버 SSH 접속 (내 PC PowerShell에서)
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\LightsailDefaultKey-ap-northeast-1.pem" ubuntu@서버IP
+```
+
+### 서버 상태 확인
+```bash
+# n8n 실행 중인지 확인
+docker ps
+
+# 파이프라인 로그 확인
+tail -f ~/brain-pipeline/logs/cron.log
+
+# Telegram 봇 로그
+tail -f ~/brain-pipeline/logs/telegram-bot.log
+```
+
+### Telegram으로 원격 제어
+```
+/run      → 파이프라인 즉시 실행
+/status   → 현재 상태 확인
+/logs     → 최근 실행 로그
+/help     → 명령어 목록
+```
+
+### 코드 수정 후 서버 재업로드 (내 PC PowerShell에서)
+```powershell
+scp -i "$env:USERPROFILE\.ssh\LightsailDefaultKey-ap-northeast-1.pem" `
+  "C:\Users\내이름\brain-pipeline-v2\수정한파일.js" `
+  ubuntu@서버IP:~/brain-pipeline/
+```
+
+---
+
+## 자주 발생하는 오류
+
+| 오류 | 원인 | 해결 |
 |---|---|---|
-| Anthropic API | 사용량 기반 | $3~8 |
-| ElevenLabs | Starter | $5 |
-| Pictory | Basic | $19 |
-| n8n | Cloud Starter | $20 (자체 서버 시 $0) |
-| YouTube API | 무료 | $0 |
-| PubMed API | 무료 | $0 |
-| **합계** | | **$27~52/월** |
+| SSH 접속 안 됨 | 키 파일 권한 문제 | icacls 명령어 재실행 |
+| n8n 접속 안 됨 | 방화벽 포트 미개방 | Lightsail 네트워킹 → 5678 포트 확인 |
+| PubMed 결과 없음 | API 속도 제한 | PUBMED_API_KEY 설정 또는 딜레이 증가 |
+| Telegram 알림 없음 | BOT_TOKEN 또는 CHAT_ID 오류 | .env 파일 재확인 |
+| YouTube 업로드 실패 | Refresh Token 만료 | PHASE 4-4-3 재실행 |
 
----
-
-## 실행 후 당신이 하는 일 (주 3~4시간)
-
-```
-월요일 오전: Slack 알림 확인 (5분)
-          ↓
-         스크립트 내용 검토 — 사실 오류 체크 (15~20분)
-          ↓
-         Pictory에서 영상 합성 클릭 (10분)
-          ↓
-수요일/금요일: 같은 과정 반복
-          ↓
-         YouTube Studio에서 예약 발행 확인 (5분)
-```
-
----
-
-## 문제 해결
-
-**PubMed 결과 없음:**
-- `config.js`의 `searchTerms` 영어로 설정 확인
-- VPN 사용 시 접속 차단될 수 있음
-
-**Claude API 오류:**
-- API 키 확인
-- 잔액 충전 (https://console.anthropic.com/billing)
-
-**ElevenLabs 음성 품질 이슈:**
-- `stability` 값 0.65~0.80 범위에서 조정
-- 다른 Voice ID 시도
-
-**YouTube 업로드 실패:**
-- Refresh Token 만료 시 STEP 4-2 재실행
-- OAuth 동의 화면에서 본인 Gmail 테스터로 추가 필요
